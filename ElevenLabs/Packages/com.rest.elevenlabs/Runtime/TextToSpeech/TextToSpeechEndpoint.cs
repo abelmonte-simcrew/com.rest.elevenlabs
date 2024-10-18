@@ -174,6 +174,9 @@ namespace ElevenLabs.TextToSpeech
         /// <returns>Downloaded clip path, and the loaded audio clip.</returns>
         public async Task<VoiceClip> StreamTextToSpeechAsync(string text, Voice voice, Action<AudioClip> partialClipCallback, VoiceSettings voiceSettings = null, Model model = null, OutputFormat outputFormat = OutputFormat.PCM_24000, int? optimizeStreamingLatency = null, CancellationToken cancellationToken = default)
             => await StreamTextToSpeechAsync(new TextToSpeechRequest(voice, text, Encoding.UTF8, voiceSettings ?? voice.Settings ?? await client.VoicesEndpoint.GetDefaultVoiceSettingsAsync(cancellationToken), outputFormat, optimizeStreamingLatency, model), partialClipCallback, cancellationToken);
+        
+        ublic async Task<VoiceClip> StreamTextToSpeechAsync(string text, Voice voice, Action<float[]> partialClipDataCallback, VoiceSettings voiceSettings = null, Model model = null, OutputFormat outputFormat = OutputFormat.PCM_24000, int? optimizeStreamingLatency = null, CancellationToken cancellationToken = default)
+            => await StreamTextToSpeechAsync(new TextToSpeechRequest(voice, text, Encoding.UTF8, voiceSettings ?? voice.Settings ?? await client.VoicesEndpoint.GetDefaultVoiceSettingsAsync(cancellationToken), outputFormat, optimizeStreamingLatency, model), partialClipCallback, cancellationToken);
 
         /// <summary>
         /// Converts text into speech using a voice of your choice and returns audio as an audio stream.
@@ -187,7 +190,7 @@ namespace ElevenLabs.TextToSpeech
         /// Optional, <see cref="CancellationToken"/>.
         /// </param>
         /// <returns>Downloaded clip path, and the loaded audio clip.</returns>
-        public async Task<VoiceClip> StreamTextToSpeechAsync(TextToSpeechRequest request, Action<AudioClip> partialClipCallback, CancellationToken cancellationToken = default)
+        public async Task<VoiceClip> StreamTextToSpeechAsync(TextToSpeechRequest request, Action<float[]> partialClipCallback, CancellationToken cancellationToken = default)
         {
             var frequency = request.OutputFormat switch
             {
@@ -247,7 +250,80 @@ namespace ElevenLabs.TextToSpeech
                         return;
                     }
 
-                    partialClipCallback.Invoke(audioClip);
+                    partialClipCallback.Invoke(chunk);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError(e);
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Converts text into speech using a voice of your choice and returns the audio raw data.
+        /// </summary>
+        /// <param name="request"><see cref="TextToSpeechRequest"/>.</param>
+        /// <param name="partialClipDataCallback">
+        /// Optional, Callback to enable streaming audio as it comes in.<br/>
+        /// Returns partial <see cref="float[]"/>.
+        /// </param>
+        /// <param name="cancellationToken">
+        /// Optional, <see cref="CancellationToken"/>.
+        /// </param>
+        /// <returns>Downloaded clip path, and the loaded audio clip.</returns>
+        public async Task<VoiceClip> StreamTextToSpeechAsync(TextToSpeechRequest request, Action<float[]> partialClipDataCallback, CancellationToken cancellationToken = default)
+        {
+            var frequency = request.OutputFormat switch
+            {
+                OutputFormat.MP3_44100_64 => throw new InvalidOperationException($"{nameof(request.OutputFormat)} must be a PCM format for streaming!"),
+                OutputFormat.MP3_44100_96 => throw new InvalidOperationException($"{nameof(request.OutputFormat)} must be a PCM format for streaming!"),
+                OutputFormat.MP3_44100_128 => throw new InvalidOperationException($"{nameof(request.OutputFormat)} must be a PCM format for streaming!"),
+                OutputFormat.MP3_44100_192 => throw new InvalidOperationException($"{nameof(request.OutputFormat)} must be a PCM format for streaming!"),
+                OutputFormat.PCM_16000 => 16000,
+                OutputFormat.PCM_22050 => 22050,
+                OutputFormat.PCM_24000 => 24000,
+                OutputFormat.PCM_44100 => 44100,
+                _ => throw new ArgumentOutOfRangeException(nameof(request.OutputFormat), request.OutputFormat, null)
+            };
+            var payload = JsonConvert.SerializeObject(request, ElevenLabsClient.JsonSerializationOptions);
+            var parameters = new Dictionary<string, string>
+            {
+                { OutputFormatParameter, request.OutputFormat.ToString().ToLower() }
+            };
+
+            if (request.OptimizeStreamingLatency.HasValue)
+            {
+                parameters.Add(OptimizeStreamingLatencyParameter, request.OptimizeStreamingLatency.Value.ToString());
+            }
+
+            var part = 0;
+            var response = await Rest.PostAsync(GetUrl($"/{request.Voice.Id}/stream", parameters), payload, StreamCallback, eventChunkSize: 8192, new RestParameters(client.DefaultRequestHeaders), cancellationToken).ConfigureAwait(true);
+            response.Validate(EnableDebug);
+
+            if (!response.Headers.TryGetValue(HistoryItemId, out var clipId))
+            {
+                throw new ArgumentException("Failed to parse clip id!");
+            }
+
+            var pcmData = PCMEncoder.Decode(response.Data);
+            var downloadDirectory = await GetCacheDirectoryAsync(request.Voice);
+            var cachedPath = $"{downloadDirectory}/{clipId}.ogg";
+            var oggBytes = await OggEncoder.ConvertToBytesAsync(pcmData, frequency, 1, cancellationToken: cancellationToken);
+            await File.WriteAllBytesAsync(cachedPath, oggBytes, cancellationToken: cancellationToken);
+            var fullClip = await Rest.DownloadAudioClipAsync($"file://{cachedPath}", AudioType.OGGVORBIS, parameters: new RestParameters(debug: EnableDebug), compressed: false, streamingAudio: true, cancellationToken: cancellationToken);
+            return new VoiceClip(clipId, request.Text, request.Voice, fullClip, cachedPath);
+
+            void StreamCallback(Response partialResponse)
+            {
+                try
+                {
+                    if (!partialResponse.Headers.TryGetValue(HistoryItemId, out clipId))
+                    {
+                        throw new ArgumentException("Failed to parse clip id!");
+                    }
+
+                    var chunk = PCMEncoder.Decode(partialResponse.Data);
+                    partialClipDataCallback.Invoke(chunk);
                 }
                 catch (Exception e)
                 {
